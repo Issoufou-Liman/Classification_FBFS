@@ -73,10 +73,16 @@ pacman::p_load(
   tidyverse,
   sf,
   grid,
-  gridExtra
+  gridExtra,
+  stars,
+  rgdal,
+  raster
 )
 
 ee_Initialize(email = 'issoufoul@gmail.com', drive = TRUE)
+
+ifelse(!dir.exists(file.path(getwd(), 'figures')), dir.create(file.path(getwd(), 'figures')), FALSE)
+ifelse(!dir.exists(file.path(getwd(), 'output_files')), dir.create(file.path(getwd(), 'output_files')), FALSE)
 ```
 
 ```{tikz conceptual-class,echo=FALSE,include=FALSE,fig.path='figures/',fig.ext='pdf',cache=FALSE,engine.opts=list(engine='xetex', template="latex/tikz2pdf.tex")}
@@ -158,12 +164,19 @@ child [yes] { node {Permanent water body}
 \end{tikzpicture}
 ```
 
-```{r fig2,echo=FALSE,out.width='100%',fig.cap="A Conceptual classification of flood-based agriculture using simple decision tree rules based on water, vegetation and management aspects"}
+```{r fig1,echo=FALSE,out.width='100%',fig.cap="A Conceptual classification of flood-based agriculture using simple decision tree rules based on water, vegetation and management aspects"}
 knitr::include_graphics("figures/conceptual-class-1.pdf")
 ```
+
 ```{r common-specs,include=FALSE,echo=FALSE,cache=FALSE}
 maxi = 17;
+plot_scale = 3000
+# plot_scale = 30
 
+ROC_steps = 100
+ROC_scale_big = 30000
+ROC_scale_small = 1000
+nValidPts = 100
 ## Define a palette for the discrete output classification.####
 
 palette = c(
@@ -553,7 +566,7 @@ mapClassProbabilities <- function  (image, training, propertyName){
       addBands(ee$Image$constant(index)$int()); # .rename('index');
     return (x);
   }));
-  classIndex = ee$ImageCollection(classIndex)$reduce(ee$Reducer$max(2))$rename('prob', 'index');
+  classIndex = ee$ImageCollection(classIndex)$reduce(ee$Reducer$max(2))$rename(list('prob', 'index'));
   # $select('index');
   return (classIndex);
 }
@@ -572,7 +585,7 @@ rocThis = function(image, targetFeature, nonTargetFeature, scale=30, ROC_steps=1
       # }
     targetFeature = image$reduceRegions(
       collection=targetFeature,
-      reducer=ee.Reducer$max()$setOutputs(list('proba')),
+      reducer=ee$Reducer$max()$setOutputs(list('proba')),
       scale=scale
     )$
     map(function(x){
@@ -597,7 +610,7 @@ rocThis = function(image, targetFeature, nonTargetFeature, scale=30, ROC_steps=1
       ee$List$sequence(
         start=ROC_min, 
         end=ROC_max,
-        step=null,
+        step=NULL,
         count=ROC_steps
       )$
       map(ee_utils_pyfunc(function (cutoff) {
@@ -640,7 +653,7 @@ rocThis = function(image, targetFeature, nonTargetFeature, scale=30, ROC_steps=1
         
         # Create a null geometry feature with the dictionary of properties.
         out = ee$Feature(
-          null,
+          NULL,
           c(
             cutoff=cutoff, 
             TPR=TPR, 
@@ -671,6 +684,115 @@ rocThis = function(image, targetFeature, nonTargetFeature, scale=30, ROC_steps=1
     
     return (ROC); 
   };
+
+process_ndsi <- function(ndsi){
+    # ######
+    xy <- st_coordinates(ndsi)
+    ndsi <- st_drop_geometry(ndsi)
+    ndsi <- data.frame(ndsi, xy)
+    rownames(ndsi) <- ndsi$id
+    ndsi <- ndsi[-1]
+    remove_outliers <- function(x, na.rm = TRUE, ...) {
+      qnt <- quantile(x, probs=c(.25, .75), na.rm = na.rm, ...)
+      H <- 1.5 * IQR(x, na.rm = na.rm)
+      y <- x
+      y[x < (qnt[1] - H)] <- NA
+      y[x > (qnt[2] + H)] <- NA
+      y
+    }
+
+    ndsi <- sapply(unique(ndsi$cluster), function(i){
+      x = ndsi[ndsi$cluster == i, ]
+      out = apply(x[, c('GoaNDWI1', 'McfeeterNDWI', 'NDFI', 'NDVI', 'elev', 'slope')], 2, remove_outliers)
+      out = na.omit(out)
+      out = rownames(x) %in% rownames(out)
+      x[out, ]
+    }, simplify = FALSE, USE.NAMES = TRUE)
+    ndsi <- do.call(rbind, ndsi)
+    ndsi <- data.frame(ndsi, stringsAsFactors = FALSE)
+    # ndsi$id <- rownames(ndsi)
+    # #####
+    # ndsi <- st_drop_geometry(ndsi)
+    ndsi$slope = ndsi$slope/100 # to make slope to the scale of ndsi
+    ndsi$elev = ndsi$elev/10000 # to make elevation to the scale of ndsi
+    id_cols <- stringr::str_split_fixed(rownames(ndsi), "_", 2)
+    colnames(id_cols) <- c('Month', 'Point_id')
+    ndsi <- data.frame(id_cols[, c(2,1)], ndsi)
+    ndsi$Month <- as.integer(ndsi$Month)
+    # head(ndsi)
+    ndsi <- ndsi[order(ndsi$Month, decreasing = FALSE),]  
+    ndsi <- transform(ndsi, MonthAbb = month.abb[Month])
+    ndsi$MonthAbb <- factor(ndsi$MonthAbb, levels = unique(ndsi$MonthAbb))
+    
+    ndsi$cluster <- paste("Class", ndsi$cluster)
+    ndsi$cluster <- factor(ndsi$cluster, unique(ndsi$cluster))
+    return(ndsi)
+    # ndsi  <- reshape2::melt(ndsi, id.vars = c("Point_id", "Month", "MonthAbb", "cluster", "X", "Y"))
+  }
+ 
+get_feature_bbox <- function(geometry){
+  bbox = geometry$geometry()$bounds();
+  listCoords = ee$Array$cat(bbox$coordinates(), 1); 
+  xCoords = listCoords$slice(1, 0, 1)
+  yCoords = listCoords$slice(1, 1, 2)
+  xMin = xCoords$reduce('min', list(0))$get(list(0,0))
+  xMax = xCoords$reduce('max', list(0))$get(list(0,0));
+  yMin = yCoords$reduce('min', list(0))$get(list(0,0));
+  yMax = yCoords$reduce('max', list(0))$get(list(0,0));
+  geometry <- ee$Geometry$Rectangle(
+    coords = c(xMin, yMin, xMax,  yMax),
+    proj = "EPSG:4326",
+    geodesic = FALSE
+  )
+}
+
+gplot_data <- function(x, maxpixels=ncell(x),...){
+  if (maxpixels < ncell(x)){
+    x <- sampleRegular(x, size = maxpixels, asRaster=TRUE)
+  }
+  coords <- xyFromCell(x, seq_len(ncell(x)))
+  dat <- stack(as.data.frame(getValues(x)))
+  names(dat) <- c('value', 'variable')
+  
+  dat <- cbind(coords, dat)
+}
+
+plot_this <- function(stack, strip_label = names(stack), fill_col, discrete=TRUE, classes=NULL, part = NULL){
+  data = gplot_data(stack)
+  if(!is.null(part)){
+    data = data[data$variable == part, ]
+  }
+  data = data[with(data, order(value)), ]
+  data <- data[!is.na(data$value), ]
+  if(discrete){
+    data$value = factor(data$value, levels = unique(data$value))
+    if(!is.null(classes)){
+      names(classes) = levels(data$value)
+      data$value = plyr::revalue(x=data$value, replace = classes)
+    }
+  }
+  
+  names(strip_label) <- names(stack)
+  strip_label <- as_labeller(strip_label)
+  
+  
+  ggplot()+
+    geom_raster(data=data, aes(x, y, fill = value))+
+    facet_wrap(~variable, labeller = strip_label)+
+    fill_col+
+    coord_equal()+
+    scale_x_continuous(expand = c(0, 0)) +
+    scale_y_continuous(expand = c(0, 0))+
+    theme_minimal()+
+    labs(x = "Longitude", y = "Latitude")
+}
+
+get_legend <- function(a.gplot){
+  tmp <- ggplot_gtable(ggplot_build(a.gplot))
+  leg <- which(sapply(tmp$grobs, function(x) x$name) == "guide-box")
+  legend <- tmp$grobs[[leg]]
+  return(legend)
+}
 ```
 
 ```{r kisumu,include=FALSE,echo=FALSE,cache=FALSE}
@@ -707,69 +829,55 @@ Map$addLayer(
 #   fileFormat='GeoTIFF',
 #   maxPixels=1e13
 # );
-ndsi = collectLansatImages ('LSR', roiKis, startYear, endYear, months);
-
-ndsi = ndsi$map(ee_utils_pyfunc(function(x){
-  return (stratified$rename('class')$
-  addBands(x$normalizedDifference(list('nir', 'red'))$rename('NDVI'))$
-  addBands(x$normalizedDifference(list('nir', 'swir1'))$rename('GoaNDWI1'))$
-  # addBands(x$normalizedDifference(list('nir', 'swir2'))$rename('GoaNDWI2'))$
-  addBands(x$normalizedDifference(list('green', 'nir'))$rename('McfeeterNDWI'))$
-  addBands(x$normalizedDifference(list('red', 'swir2'))$rename('NDFI'))$
-  addBands(ee$Image('CGIAR/SRTM90_V4')$select('elevation')$rename('elev'))$
-  addBands(ee$Terrain$slope(ee$Image('CGIAR/SRTM90_V4')$select('elevation')$rename('slope')))$
-  stratifiedSample(
-    numPoints=1000, 
-     # classBand: 'class', 
-    region=roiKis, 
-    scale=500, 
-    projection=NULL, 
-    seed=0, 
-    classValues=NULL, 
-    classPoints=NULL, 
-    dropNulls=TRUE, 
-    tileScale=1, 
-    geometries=FALSE
-  ))
-}))$flatten()
-
-ndsi <- ee_as_sf(ndsi, via = 'getInfo', maxFeatures= 216000)
-
-process_ndsi <- function(ndsi){
-  ndsi <- st_drop_geometry(ndsi)
-  ndsi$slope = ndsi$slope/100 # to make slope to the scale of ndsi
-  ndsi$elev = ndsi$elev/10000 # to make elevation to the scale of ndsi
-  id_cols <- stringr::str_split_fixed(ndsi$id, "_", 2)
-  colnames(id_cols) <- c('Month', 'Point_id')
-  ndsi <- data.frame(id_cols[, c(2,1)], ndsi[, -1])
-  ndsi$Month <- as.integer(ndsi$Month)
-  # head(ndsi)
-  ndsi <- ndsi[order(ndsi$Month, decreasing = FALSE),]  
-  ndsi <- transform(ndsi, MonthAbb = month.abb[Month])
-  ndsi$MonthAbb <- factor(ndsi$MonthAbb, levels = unique(ndsi$MonthAbb))
+ ndsi = collectLansatImages ('LSR', roiKis, startYear, endYear, months);
   
-  ndsi$class <- paste("Class", ndsi$class)
-  ndsi$class <- factor(ndsi$class, unique(ndsi$class))
-  ndsi  <- reshape2::melt(ndsi, id.vars = c("Point_id", "Month", "MonthAbb", "class"))
-}
-```
+  ndsi = ndsi$map(ee_utils_pyfunc(function(x){
+    return (stratified$rename('cluster')$
+    addBands(x$normalizedDifference(list('nir', 'red'))$rename('NDVI'))$
+    addBands(x$normalizedDifference(list('nir', 'swir1'))$rename('GoaNDWI1'))$
+    # addBands(x$normalizedDifference(list('nir', 'swir2'))$rename('GoaNDWI2'))$
+    addBands(x$normalizedDifference(list('green', 'nir'))$rename('McfeeterNDWI'))$
+    addBands(x$normalizedDifference(list('red', 'swir2'))$rename('NDFI'))$
+    addBands(ee$Image('CGIAR/SRTM90_V4')$select('elevation')$rename('elev'))$
+    addBands(ee$Terrain$slope(ee$Image('CGIAR/SRTM90_V4')$select('elevation')$rename('slope')))$
+    stratifiedSample(
+      numPoints=200, 
+       # classBand: 'cluster', 
+      region=roiKis, 
+      scale=90, 
+      projection=NULL, 
+      seed=0, 
+      classValues=NULL, 
+      classPoints=NULL, 
+      dropNulls=TRUE, 
+      tileScale=1, 
+      geometries=TRUE
+    ))
+  }))$flatten()
+  
+  ndsi <- ee_as_sf(ndsi, via = 'getInfo', maxFeatures= 216000)
+  projcrs <- st_crs(ndsi)
 
-
-```{r kisumu-unsuper-ndsi,include=FALSE,echo=FALSE,cache=FALSE}
-p <- ndsi %>%
-  process_ndsi()%>%
-  ggplot(aes(MonthAbb, value, fill=Point_id, group=variable))+
-  geom_smooth(aes(color = variable), method = 'loess', se=TRUE, span = 0.4)+
-  facet_wrap(.~class, ncol = 6)+
-  theme_minimal()+
-  theme(
-    legend.position = 'bottom',
-    axis.title.x = element_blank(),
-    legend.title = element_blank()
-  )+
-  labs(y="spectral index")
-
-gb = grid.rect(.5,.5,width=unit(1,"npc"), height=unit(1,"npc"), 
+  p <- ndsi %>%
+    process_ndsi()%>%
+    reshape2::melt(id.vars = c("Point_id", "Month", "MonthAbb", "cluster", "X", "Y"))%>%
+    ggplot(aes(as.numeric(MonthAbb), value, fill=Point_id, group=variable))+
+    geom_smooth(aes(colour = variable), method = 'loess', se=TRUE, span = 0.1, size = 0.5)+
+    # geom_line(aes(colour = variable))+
+    facet_wrap(.~cluster, ncol = 6)+
+    theme_minimal(base_family = 'sans')+
+    labs(y="spectral index")+
+    guides(colour=guide_legend(ncol=1))+
+    scale_x_continuous(breaks = seq(1,12,3), minor_breaks = 1:12, labels = month.abb[seq(1,12,3)])+
+    scale_color_manual(labels = c("Goa NDWI", "Mcfeeter NDWI", "NDFI", "NDVI", "Elevation", "Slope"),
+                       values = c("blue", "cornflowerblue", "red", "forestgreen", "orange", "purple")) +
+    theme(
+      legend.position = c(0.925, 0.15),
+      axis.title.x = element_blank(),
+      # axis.text = element_text(size = 8),
+      legend.title = element_blank()
+    )
+  gb = grid.rect(.5,.5,width=unit(1,"npc"), height=unit(1,"npc"), 
                gp=gpar(lwd=1, fill=NA, col="lightgray"))
 
 p <- grid.arrange(p, ncol=1)
@@ -784,10 +892,743 @@ ggsave(plot=p, device = 'pdf', filename = "figures/Kisumu_unsuper_NDSI.pdf",
        # width = 190/25.4, height = 140/25.4, 
        dpi = 300)
 
+  ndsi <- process_ndsi(ndsi)[, c("X", "Y", "cluster")]
+  ndsi$cluster <- as.numeric(ndsi$cluster)
+  
+  # stratified = sf_as_ee(x = ndsi, via = "getInfo_to_asset", assetId = 'users/Liman/kisumu_150pts_training_checked')
 ```
 
-```{r fig4,echo=FALSE,out.width='100%',fig.cap="Temporal variability in water and vegetation for different land uses based on an unsupervised classification of 17 classes in Kisumu county, Kenya."}
+```{r kisumu-export-training-to-asset,include=FALSE,error=TRUE}
+  ndsi <- st_as_sf(x = ndsi, coords = c("X", "Y"), crs = projcrs)
+```
+
+```{r fig2,echo=FALSE,out.width='100%',fig.cap="Temporal variability in water and vegetation for different land uses based on an unsupervised classification of 17 classes in Kisumu county, Kenya."}
 knitr::include_graphics("figures/Kisumu_unsuper_NDSI.png")
+```
+
+
+```{r Tigray,include=FALSE,echo=FALSE,cache=FALSE}
+
+# Generating an unsupervized classification (for each month) based on which to collect class samples for superivised classification
+stratified = unsuperClassifyThis(imageCollection, maxi, 30, roiTig);
+# ee_print(stratified)
+
+Map$addLayer(
+  eeObject = stratified,
+  visParams = discreteVizParam,
+  name = "unsuperClassificationTigray"
+)
+
+
+# # Exporting the unsupervised classification
+# Export$image$toDrive(
+#   image=stratified,
+#   description='Tigray_unsuper_class_mode_16classes_30m_500pts_LSR_L8_L5_L4_2015_2020',
+#   folder='Tigray',
+#   scale=30,
+#   region=roiUp,
+#   fileFormat='GeoTIFF',
+#   maxPixels=1e13
+# );
+ ndsi = collectLansatImages ('LSR', roiTig, startYear, endYear, months);
+  
+  ndsi = ndsi$map(ee_utils_pyfunc(function(x){
+    return (stratified$rename('cluster')$
+    addBands(x$normalizedDifference(list('nir', 'red'))$rename('NDVI'))$
+    addBands(x$normalizedDifference(list('nir', 'swir1'))$rename('GoaNDWI1'))$
+    # addBands(x$normalizedDifference(list('nir', 'swir2'))$rename('GoaNDWI2'))$
+    addBands(x$normalizedDifference(list('green', 'nir'))$rename('McfeeterNDWI'))$
+    addBands(x$normalizedDifference(list('red', 'swir2'))$rename('NDFI'))$
+    addBands(ee$Image('CGIAR/SRTM90_V4')$select('elevation')$rename('elev'))$
+    addBands(ee$Terrain$slope(ee$Image('CGIAR/SRTM90_V4')$select('elevation')$rename('slope')))$
+    stratifiedSample(
+      numPoints=100, 
+       # classBand: 'cluster', 
+      region=roiTig, 
+      scale=90, 
+      projection=NULL, 
+      seed=0, 
+      classValues=NULL, 
+      classPoints=NULL, 
+      dropNulls=TRUE, 
+      tileScale=1, 
+      geometries=TRUE
+    ))
+  }))$flatten()
+  
+  ndsi <- ee_as_sf(ndsi, via = 'getInfo', maxFeatures= 216000)
+  projcrs <- st_crs(ndsi)
+ 
+  p <- ndsi %>%
+    process_ndsi()%>%
+    reshape2::melt(id.vars = c("Point_id", "Month", "MonthAbb", "cluster", "X", "Y"))%>%
+    ggplot(aes(as.numeric(MonthAbb), value, fill=Point_id, group=variable))+
+    geom_smooth(aes(colour = variable), method = 'loess', se=TRUE, span = 0.1, size = 0.5)+
+    # geom_line(aes(colour = variable))+
+    facet_wrap(.~cluster, ncol = 6)+
+    theme_minimal(base_family = 'sans')+
+    labs(y="spectral index")+
+    guides(colour=guide_legend(ncol=1))+
+    scale_x_continuous(breaks = seq(1,12,3), minor_breaks = 1:12, labels = month.abb[seq(1,12,3)])+
+    scale_color_manual(labels = c("Goa NDWI", "Mcfeeter NDWI", "NDFI", "NDVI", "Elevation", "Slope"),
+                       values = c("blue", "cornflowerblue", "red", "forestgreen", "orange", "purple")) +
+    theme(
+      legend.position = c(0.925, 0.15),
+      axis.title.x = element_blank(),
+      # axis.text = element_text(size = 8),
+      legend.title = element_blank()
+    )
+  gb = grid.rect(.5,.5,width=unit(1,"npc"), height=unit(1,"npc"), 
+               gp=gpar(lwd=1, fill=NA, col="lightgray"))
+
+p <- grid.arrange(p, ncol=1)
+p <- gTree(children = gList(p, gb))
+ggsave(plot=p, device = 'png', filename = "figures/Tigray_unsuper_NDSI.png", 
+       # width = 190/25.4, height = 140/25.4, 
+       dpi = 300)
+ggsave(plot=p, device = 'tiff', filename = "figures/Tigray_unsuper_NDSI.tif",
+       # width = 190/25.4, height = 140/25.4, 
+       dpi = 300)
+ggsave(plot=p, device = 'pdf', filename = "figures/Tigray_unsuper_NDSI.pdf", 
+       # width = 190/25.4, height = 140/25.4, 
+       dpi = 300)
+
+  ndsi <- process_ndsi(ndsi)[, c("X", "Y", "cluster")]
+  ndsi$cluster <- as.numeric(ndsi$cluster)
+  
+  # stratified = sf_as_ee(x = ndsi, via = "getInfo_to_asset", assetId = 'users/Liman/Tigray_150pts_training_checked')
+```
+
+```{r Tigray-export-training-to-asset,include=FALSE,error=TRUE}
+  ndsi <- st_as_sf(x = ndsi, coords = c("X", "Y"), crs = projcrs)
+```
+
+```{r fig3,echo=FALSE,out.width='100%',fig.cap="Temporal variability in water and vegetation for different land uses based on an unsupervised classification of 17 classes in Kisumu county, Kenya."}
+knitr::include_graphics("figures/Tigray_unsuper_NDSI.png")
+```
+
+```{r kisumu-tigray-binary-classification,include=FALSE,error=TRUE}
+ficher <- 'output_files/classProba.grd'
+if(!file.exists(ficher)){
+  imageCollection = collectLansatImages ('LSR', roiUp, startYear, endYear, months);
+# ee_print(imageCollection)
+## Kisumu ####
+imageCollection = imageCollection$
+  reduce(ee$Reducer$sum())$
+  rename(imageCollection$first()$bandNames())$
+  addBands(ee$Image('CGIAR/SRTM90_V4')$select('elevation')$rename('elev'))$
+  addBands(ee$Terrain$slope(ee$Image('CGIAR/SRTM90_V4')$select('elevation')$rename('elev'))$rename('slope'));
+
+stratified = unsuperClassifyThis(imageCollection, maxi, 30, roiKis);
+
+stratifiedValidateKis = stratified$stratifiedSample(
+  numPoints=nValidPts, #  43 to make this appromatimatively 30 % validation sample
+  classBand='cluster',
+  region=roiUp,
+  scale=ROC_scale_big, 
+  geometries=TRUE,
+  seed=0 # to sample different points than in the validation sample
+);
+
+stratified = stratified$stratifiedSample(
+  numPoints=100, #  to make this appromatimatively 70 % validation sample
+  classBand='cluster',
+  region=roiKis,
+  scale=90, 
+  geometries=TRUE,
+  seed=0 # to sample different points than in the validation sample
+);
+
+classProbaKis = mapClassProbabilities(imageCollection, stratified, 'cluster');
+classProbaKis = ee_as_raster(image = classProbaKis$float(), region = get_feature_bbox(roiUp), via = "drive",
+                             scale = plot_scale, maxPixels=1.0e13, dsn = 'classProbaKis', container = 'Kisumu')
+# classProbaKis = flip(classProbaKis, direction = 'y')
+
+## Tigray #####
+
+stratified = unsuperClassifyThis(imageCollection, maxi, 30, roiTig);
+
+stratifiedValidateTig = stratified$stratifiedSample(
+  numPoints=nValidPts, #  43 to make this appromatimatively 30 % validation sample
+  classBand='cluster',
+  region=roiUp,
+  scale=ROC_scale_big, 
+  geometries=TRUE,
+  seed=0 # to sample different points than in the validation sample
+);
+
+stratified = stratified$stratifiedSample(
+  numPoints=100, #  to make this appromatimatively 70 % validation sample
+  classBand='cluster',
+  region=roiTig,
+  scale=90, 
+  geometries=TRUE,
+  seed=0 # to sample different points than in the validation sample
+);
+
+classProbaTig = mapClassProbabilities(imageCollection, stratified, 'cluster');
+classProbaTigValidate = classProbaTig
+classProbaTig = ee_as_raster(image = classProbaTig$float(), region = get_feature_bbox(roiUp), via = "drive",
+                             scale = plot_scale, maxPixels=1.0e13, dsn = 'classProbaTig', container = 'Tigray')
+# classProbaTig = flip(classProbaTig, direction = 'y')
+
+classProba <- brick(classProbaKis[[1]], classProbaTig[[1]]); names(classProba) = c('Kisumu', 'Tigray')
+classValue <- brick(classProbaKis[[2]], classProbaTig[[2]]); names(classValue) = c('Kisumu', 'Tigray')
+# rm(classProbaKis, classProbaTig )
+writeRaster(x = classProba, filename = 'output_files/classProba.grd')
+writeRaster(x = classValue, filename = 'output_files/classValue.grd')
+} else {
+  classProba <- brick('output_files/classProba.grd')
+  classValue <- brick('output_files/classValue.grd')
+}
+```
+
+```{r kisumu-tigray-binary-classification-proba-plot-small,include=FALSE}
+Kisumu <- getData('GADM', country='KEN', level=1, path = 'output_files')
+Kisumu <- Kisumu [Kisumu$NAME_1 == "Kisumu", ]
+Tigray <- getData('GADM', country='ETH', level=1, path = 'output_files')
+Tigray <- Tigray [Tigray$NAME_1 == "Tigray", ]
+
+fill_col =   scale_fill_gradientn(colours=rev(terrain.colors(225)), breaks = seq(0, 1, 0.2))
+
+## Kisumu Proba ####
+
+p = plot_this(crop(classProba, Kisumu), fill_col=fill_col, discrete = FALSE, part = "Kisumu")+
+  theme(
+    legend.direction = 'horizontal',
+    legend.position = 'bottom',
+    legend.background = element_rect(fill= NA, colour = NA),
+    strip.background = element_blank(),
+    strip.text = element_blank(),
+    plot.margin = margin(0,0,0,0)
+  )+
+  guides(fill = guide_colourbar(title.position="top", title.hjust = 0.5,
+                                barheight = 0.5,
+                                title = 'Class probability'))
+proba_legend = get_legend (p)
+proba_kis = p + 
+  theme(
+    legend.position = 'none',
+    axis.title = element_blank()
+  )+
+  geom_path(data=fortify(Kisumu), aes(x = long, y = lat, group=group), colour = 'black', size = 0.25, alpha = 0.5)
+  
+## Tigray Proba ####
+
+p = plot_this(crop(classProba, Tigray), fill_col=fill_col, discrete = FALSE, part = "Tigray")+
+  theme(
+    legend.direction = 'horizontal',
+    legend.position = 'bottom',
+    legend.background = element_rect(fill= NA, colour = NA),
+    strip.background = element_blank(),
+    strip.text = element_blank(),
+    plot.margin = margin(0,0,0,0)
+    )+
+  guides(fill = guide_colourbar(title.position="top", title.hjust = 0.5,
+                                barheight = 0.5,
+                                title = 'Probability'))
+# proba_legend = get_legend (p)
+proba_Tig = p +
+  theme(
+    legend.position = 'none',
+    axis.title = element_blank()
+  )+
+    geom_path(data=fortify(Tigray), aes(x = long, y = lat, group=group), colour = 'black', size = 0.25, alpha = 0.5)
+
+
+## combined proba ####
+
+# Proba = gtable_cbind(ggplotGrob(proba_kis), ggplotGrob(proba_Tig), size = 'last')
+Proba = arrangeGrob(proba_kis, proba_Tig,
+                    widths=unit(c(1, 0.69), c("null", "null"))
+)
+
+# rm (proba_kis, proba_Tig)
+
+## Kisumu Classes ####
+
+fill_col =   scale_fill_manual(values=paste0('#', palette))
+
+class_kis = plot_this(crop(classValue, Kisumu), fill_col=fill_col, discrete = TRUE, classes = paste("class class class", 1:17), part = "Kisumu")+
+  theme(
+    legend.direction = 'horizontal',
+    legend.position = 'bottom',
+    legend.background = element_rect(fill= NA, colour = NA),
+    plot.margin = margin(0,0,0,0)
+  )+
+  guides(fill = guide_legend(title.position ="top", title.hjust = 0.5,
+                                barheight = 0.5,
+                                title = 'Kisumu classes', ncol = 2))+ 
+  theme(
+  axis.text.x = element_blank(),
+  axis.title = element_blank()
+)+
+  geom_path(data=fortify(Kisumu), aes(x = long, y = lat, group=group), colour = 'black', size = 0.25, alpha = 0.5)
+
+
+## Tigray Classes ####
+
+class_Tig = plot_this(crop(classValue, Tigray), fill_col=fill_col, discrete = TRUE, classes = paste("class class class", 1:17), part = "Tigray")+
+  theme(
+    legend.direction = 'horizontal',
+    legend.position = 'bottom',
+    legend.background = element_rect(fill= NA, colour = NA),
+    plot.margin = margin(0,0,0,0)
+  )+
+  guides(fill = guide_legend(title.position ="top", title.hjust = 0.5,
+                                barheight = 0.5,
+                                title = 'Tigray classes', ncol = 2))+
+  theme(
+  axis.text.x = element_blank(),
+  axis.title = element_blank()
+)+
+    geom_path(data=fortify(Tigray), aes(x = long, y = lat, group=group), colour = 'black', size = 0.25, alpha = 0.5)
+
+
+## combined classes ####
+
+# classes = gtable_cbind(ggplotGrob(class_kis), ggplotGrob(class_Tig), size = 'last')
+classes = arrangeGrob(class_kis, class_Tig,
+                    widths=unit(c(1, 0.69), c("null", "null"))
+)
+# rm (class_kis, class_Tig)
+
+## combining plots ####
+# p = gtable_rbind(classes, Proba)
+p = grid.arrange(classes, Proba, heights=unit(c(1, 0.5), c("null", "null")))
+p = grid.arrange(p, proba_legend, heights=unit(c(1, 0.09), c("null", "null")))
+
+# rm (Proba, classes)
+gb = grid.rect(.5,.5,width=unit(1,"npc"), height=unit(1,"npc"),
+               gp=gpar(lwd=1, fill=NA, col="lightgray"))
+
+p <- grid.arrange(p, ncol=1)
+p <- gTree(children = gList(p, gb))
+
+ggsave(plot=p, device = 'png', filename = "figures/Kisumu_Tigray_classes_Proba.png",
+       width = 5.28, height = 7,
+       dpi = 300)
+ggsave(plot=p, device = 'tiff', filename = "figures/Kisumu_Tigray_classes_Proba.tif",
+       width = 5.28, height = 7,
+       dpi = 300)
+ggsave(plot=p, device = 'pdf', filename = "figures/Kisumu_Tigray_classes_Proba.pdf",
+      width = 5.28, height = 7,
+       dpi = 300)
+```
+
+```{r fig4,echo=FALSE,out.width='100%',fig.cap="Land use classes based on a probablistic classification ofland use classes in Kisumu County (Kenya) and Tigray (Ethiopia) upscaled to Horn of Africa"}
+knitr::include_graphics("figures/Kisumu_Tigray_classes_Proba.png")
+```
+
+```{r kisumu-tigray-binary-classification-proba-plot-big,include=FALSE}
+fill_col =   scale_fill_gradientn(colours=rev(terrain.colors(225)), breaks = seq(0, 1, 0.2))
+p = plot_this(classProba, fill_col=fill_col, discrete = FALSE)+
+  theme(
+    legend.direction = 'horizontal',
+    legend.position = c(0.875, 0.15),
+    legend.background = element_rect(fill= NA, colour = NA)
+    )+
+  guides(fill = guide_colourbar(title.position="top", title.hjust = 0.5,
+                                barheight = 0.5,
+                                title = 'Probability'))
+
+gb = grid.rect(.5,.5,width=unit(1,"npc"), height=unit(1,"npc"), 
+               gp=gpar(lwd=1, fill=NA, col="lightgray"))
+
+p <- grid.arrange(p, ncol=1)
+p <- gTree(children = gList(p, gb))
+ggsave(plot=p, device = 'png', filename = "figures/Kisumu_Tigray_upscaled_Proba.png", 
+       width = 5.28, height = 3.26,
+       dpi = 300)
+ggsave(plot=p, device = 'tiff', filename = "figures/Kisumu_Tigray_upscaled_Proba.tif",
+       width = 5.28, height = 3.26,
+       dpi = 300)
+ggsave(plot=p, device = 'pdf', filename = "figures/Kisumu_Tigray_upscaled_Proba.pdf", 
+       width = 5.28, height = 3.26,
+       dpi = 300)
+```
+
+```{r fig5,echo=FALSE,out.width='100%',fig.cap="Land use classes based on a probablistic classification ofland use classes in Kisumu County (Kenya) and Tigray (Ethiopia) upscaled to Horn of Africa"}
+knitr::include_graphics("figures/Kisumu_Tigray_upscaled_Proba.png")
+```
+
+```{r kisumu-tigray-binary-classification-class-plot-big,include=FALSE}
+fill_col =   scale_fill_manual(values=paste0('#', palette))
+
+## Kisumu classifier ####
+
+class_Kis = plot_this(classValue, fill_col=fill_col, discrete = TRUE, classes = paste("class class class", 1:17), part = 'Kisumu')+
+  theme(
+    legend.direction = 'horizontal',
+    legend.position = 'bottom',
+    legend.background = element_rect(fill= NA, colour = NA),
+    plot.margin = margin(0,0,0,0)
+  )+
+  guides(fill = guide_legend(title.position ="top", title.hjust = 0.5,
+                                keyheight = 0.5,keywidth = 0.75,
+                                title = 'Class', ncol = 1))
+# leg_Kis <- get_legend(class_Kis)
+# class_Kis = class_Kis + 
+#   theme(
+#     legend.position = "none",
+#     axis.title = element_blank()
+#   )
+
+class_Kis = class_Kis +
+  theme(
+    legend.position = c(0.85, 0.225),
+    axis.title = element_blank()
+  )
+
+## Tigray classifier ####
+
+class_Tig = plot_this(classValue, fill_col=fill_col, discrete = TRUE, classes = paste("class class class", 1:17), part = 'Tigray')+
+  theme(
+    legend.direction = 'horizontal',
+    legend.position = 'bottom',
+    legend.background = element_rect(fill= NA, colour = NA),
+    plot.margin = margin(0,0,0,0)
+  )+
+  guides(fill = guide_legend(title.position ="top", title.hjust = 0.5,
+                                keyheight = 0.5,keywidth = 0.75,
+                                title = 'Class', ncol = 1))
+# leg_Tig <- get_legend(class_Tig)
+# class_Tig = class_Tig + 
+#   theme(
+#     legend.position = "none",
+#     axis.title = element_blank(),
+#     axis.text.y = element_blank()
+#   )
+
+class_Tig = class_Tig +
+  theme(
+    legend.position = c(0.85, 0.225),
+    axis.title = element_blank(),
+    axis.text.y = element_blank()
+  )
+
+p = gtable_cbind(ggplotGrob(class_Kis), ggplotGrob(class_Tig), size = 'last')
+p = grid.arrange(p)
+p$bottom = grid::textGrob("Longitude",
+                            # x=0.4, hjust=0, vjust = 0.5,
+                            rot = 0,
+                            gp = gpar(fontfamily='serif',fontsize=10,fontface="plain", col="black"))
+p$left = grid::textGrob("Latitude",
+                          rot = 90,
+                          gp = gpar(fontfamily='serif',fontsize=10,fontface="plain", col="black"))
+p$ncol <- 1
+p <- do.call(grid.arrange, p)
+
+gb = grid.rect(.5,.5,width=unit(1,"npc"), height=unit(1,"npc"), 
+               gp=gpar(lwd=1, fill=NA, col="lightgray"))
+
+p <- gTree(children = gList(p, gb))
+ggsave(plot=p, device = 'png', filename = "figures/Kisumu_Tigray_upscaled_classes.png", 
+       width = 12.1, height = 6.92,
+       dpi = 300)
+ggsave(plot=p, device = 'tiff', filename = "figures/Kisumu_Tigray_upscaled_classes.tif",
+       width = 12.1, height = 6.92,
+       dpi = 300)
+ggsave(plot=p, device = 'pdf', filename = "figures/Kisumu_Tigray_upscaled_classes.pdf", 
+       width = 12.1, height = 6.92,
+       dpi = 300)
+```
+
+```{r fig6,echo=FALSE,out.width='100%',fig.cap="Land use classes based on a probablistic classification ofland use classes in Kisumu County (Kenya) and Tigray (Ethiopia) upscaled to Horn of Africa"}
+knitr::include_graphics("figures/Kisumu_Tigray_upscaled_classes.png")
+```
+
+```{r kisumu-tigray-ROC-small,include=FALSE, error=TRUE}
+
+## Kisumu down-scaled model ####
+
+stratified = unsuperClassifyThis(imageCollection, maxi, 30, roiKis);
+
+stratifiedValidateKis = stratified$stratifiedSample(
+  numPoints=100, #  43 to make this appromatimatively 30 % validation sample
+  classBand='cluster',
+  region=roiKis,
+  scale=90,
+  geometries=TRUE,
+  seed=0 # to sample different points than in the validation sample
+);
+
+stratified = stratified$stratifiedSample(
+  numPoints=100, #  to make this appromatimatively 70 % validation sample
+  classBand='cluster',
+  region=roiKis,
+  scale=90,
+  geometries=TRUE,
+  seed=0 # to sample different points than in the validation sample
+);
+
+classProbaKis = mapClassProbabilities(imageCollection, stratified, 'cluster')$clip(roiKis);
+
+nClass = stratifiedValidateKis$aggregate_array('cluster')$distinct()$sort();
+roc = nClass$map(ee_utils_pyfunc(function(x){
+  targetFeature = stratifiedValidateKis$filter(ee$Filter$eq("cluster", x));
+  nonTargetFeature = stratifiedValidateKis$filter(ee$Filter$neq("cluster", x));
+  return (rocThis (classProbaKis$select('prob'), targetFeature, nonTargetFeature, 150, 100));
+  ## return nonTargetFeature;
+}))
+
+roc = ee$FeatureCollection(roc)$flatten()
+
+# roc <- ee_as_sf(roc, via = 'getInfo', maxFeatures= 216000)
+# projcrs <- st_crs(roc)
+# dsn = paste0(getwd(), '/', 'output_files/Kisumu_ROC.csv')
+# roc <- ee_as_sf(roc, via = 'drive', dsn = dsn)
+dsn = 'output_files/Kisumu_ROC_small.csv'
+task_vector = ee_table_to_drive(
+  roc,
+  description = "Kisumu_ROC_small",
+  folder = "Kisumu",
+  timePrefix = FALSE,
+  fileFormat = 'CSV'
+)
+
+task_vector$start()
+ee_monitoring(task_vector) # optional
+ee_drive_to_local(task = task_vector, dsn = dsn, overwrite = TRUE, consider = "last")
+rocKisSmall = read.csv(dsn)
+
+## Tigray down-scaled model ####
+
+stratified = unsuperClassifyThis(imageCollection, maxi, 30, roiTig);
+
+stratifiedValidateTig = stratified$stratifiedSample(
+  numPoints=100, #  43 to make this appromatimatively 30 % validation sample
+  classBand='cluster',
+  region=roiTig,
+  scale=90,
+  geometries=TRUE,
+  seed=0 # to sample different points than in the validation sample
+);
+
+stratified = stratified$stratifiedSample(
+  numPoints=100, #  to make this appromatimatively 70 % validation sample
+  classBand='cluster',
+  region=roiTig,
+  scale=90,
+  geometries=TRUE,
+  seed=0 # to sample different points than in the validation sample
+);
+
+classProbaTig = mapClassProbabilities(imageCollection, stratified, 'cluster')$clip(roiTig);
+
+nClass = stratifiedValidateTig$aggregate_array('cluster')$distinct()$sort();
+roc = nClass$map(ee_utils_pyfunc(function(x){
+  targetFeature = stratifiedValidateTig$filter(ee$Filter$eq("cluster", x));
+  nonTargetFeature = stratifiedValidateTig$filter(ee$Filter$neq("cluster", x));
+  return (rocThis (classProbaTig$select('prob'), targetFeature, nonTargetFeature, 1000, 100));
+  ## return nonTargetFeature;
+}))
+
+roc = ee$FeatureCollection(roc)$flatten()
+
+# roc <- ee_as_sf(roc, via = 'getInfo', maxFeatures= 216000)
+# projcrs <- st_crs(roc)
+# dsn = paste0(getwd(), '/', 'output_files/Tigray_ROC.csv')
+# roc <- ee_as_sf(roc, via = 'drive', dsn = dsn)
+dsn = 'output_files/Tigray_ROC_small.csv'
+task_vector = ee_table_to_drive(
+  roc,
+  description = "Tigray_ROC_small",
+  folder = "Tigray",
+  timePrefix = FALSE,
+  fileFormat = 'CSV'
+)
+
+task_vector$start()
+ee_monitoring(task_vector) # optional
+ee_drive_to_local(task = task_vector, dsn = dsn, overwrite = TRUE, consider = "last")
+rocTigSmall = read.csv(dsn)
+
+## Kisumu up-scaled model ####
+
+stratified = unsuperClassifyThis(imageCollection, maxi, 30, roiKis);
+
+stratifiedValidateKis = stratified$stratifiedSample(
+  numPoints=100, #  43 to make this appromatimatively 30 % validation sample
+  classBand='cluster',
+  region=roiUp,
+  scale=3500,
+  geometries=TRUE,
+  seed=0 # to sample different points than in the validation sample
+);
+
+stratified = stratified$stratifiedSample(
+  numPoints=100, #  to make this appromatimatively 70 % validation sample
+  classBand='cluster',
+  region=roiKis,
+  scale=90,
+  geometries=TRUE,
+  seed=0 # to sample different points than in the validation sample
+);
+
+classProbaKis = mapClassProbabilities(imageCollection, stratified, 'cluster');
+
+nClass = stratifiedValidateKis$aggregate_array('cluster')$distinct()$sort();
+roc = nClass$map(ee_utils_pyfunc(function(x){
+  targetFeature = stratifiedValidateKis$filter(ee$Filter$eq("cluster", x));
+  nonTargetFeature = stratifiedValidateKis$filter(ee$Filter$neq("cluster", x));
+  return (rocThis (classProbaKis$select('prob'), targetFeature, nonTargetFeature, 5000, 100));
+  ## return nonTargetFeature;
+}))
+
+roc = ee$FeatureCollection(roc)$flatten()
+ee_print(roc)
+# roc <- ee_as_sf(roc, via = 'getInfo', maxFeatures= 216000)
+# projcrs <- st_crs(roc)
+# dsn = paste0(getwd(), '/', 'output_files/Kisumu_ROC.csv')
+# roc <- ee_as_sf(roc, via = 'drive', dsn = dsn)
+dsn = 'output_files/Kisumu_ROC_big.csv'
+task_vector = ee_table_to_drive(
+  roc,
+  description = "Kisumu_ROC_big",
+  folder = "Kisumu",
+  timePrefix = FALSE,
+  fileFormat = 'CSV'
+)
+
+task_vector$start()
+ee_monitoring(task_vector) # optional
+ee_drive_to_local(task = task_vector, dsn = dsn, overwrite = TRUE, consider = "last")
+rocKisBig = read.csv(dsn)
+
+## Tigray up-scaled model ####
+
+stratified = unsuperClassifyThis(imageCollection, maxi, 30, roiTig);
+
+stratifiedValidateTig = stratified$stratifiedSample(
+  numPoints=100, #  43 to make this appromatimatively 30 % validation sample
+  classBand='cluster',
+  region=roiUp,
+  scale=3500,
+  geometries=TRUE,
+  seed=0 # to sample different points than in the validation sample
+);
+
+stratified = stratified$stratifiedSample(
+  numPoints=100, #  to make this appromatimatively 70 % validation sample
+  classBand='cluster',
+  region=roiTig,
+  scale=90,
+  geometries=TRUE,
+  seed=0 # to sample different points than in the validation sample
+);
+
+classProbaTig = mapClassProbabilities(imageCollection, stratified, 'cluster');
+
+nClass = stratifiedValidateTig$aggregate_array('cluster')$distinct()$sort();
+roc = nClass$map(ee_utils_pyfunc(function(x){
+  targetFeature = stratifiedValidateTig$filter(ee$Filter$eq("cluster", x));
+  nonTargetFeature = stratifiedValidateTig$filter(ee$Filter$neq("cluster", x));
+  return (rocThis (classProbaTig$select('prob'), targetFeature, nonTargetFeature, 5000, 100));
+  ## return nonTargetFeature;
+}))
+
+roc = ee$FeatureCollection(roc)$flatten()
+
+# roc <- ee_as_sf(roc, via = 'getInfo', maxFeatures= 216000)
+# projcrs <- st_crs(roc)
+# dsn = paste0(getwd(), '/', 'output_files/Tigray_ROC.csv')
+# roc <- ee_as_sf(roc, via = 'drive', dsn = dsn)
+dsn = 'output_files/Tigray_ROC_big.csv'
+task_vector = ee_table_to_drive(
+  roc,
+  description = "Tigray_ROC_big",
+  folder = "Tigray",
+  timePrefix = FALSE,
+  fileFormat = 'CSV'
+)
+
+task_vector$start()
+ee_monitoring(task_vector) # optional
+ee_drive_to_local(task = task_vector, dsn = dsn, overwrite = TRUE, consider = "last")
+rocTigBig = read.csv(dsn)
+
+## Combined model ####
+
+stratifiedValidate = stratifiedValidateTig$merge(stratifiedValidateKis)
+
+classProba = ee$ImageCollection$fromImages(list(classProbaKis, classProbaTig));
+classProba = classProba$reduce(ee$Reducer$max(2))$rename('prob', 'index');
+
+nClass = stratifiedValidate$aggregate_array('cluster')$distinct()$sort();
+roc = nClass$map(ee_utils_pyfunc(function(x){
+  targetFeature = stratifiedValidate$filter(ee$Filter$eq("cluster", x));
+  nonTargetFeature = stratifiedValidate$filter(ee$Filter$neq("cluster", x));
+  return (rocThis (classProba$select('prob'), targetFeature, nonTargetFeature, 5000, 100));
+  ## return nonTargetFeature;
+}))
+
+roc = ee$FeatureCollection(roc)$flatten()
+
+# roc <- ee_as_sf(roc, via = 'getInfo', maxFeatures= 216000)
+# projcrs <- st_crs(roc)
+# dsn = paste0(getwd(), '/', 'output_files/Tigray_ROC.csv')
+# roc <- ee_as_sf(roc, via = 'drive', dsn = dsn)
+dsn = 'output_files/Combined_ROC_big.csv'
+task_vector = ee_table_to_drive(
+  roc,
+  description = "Combined_ROC_big",
+  folder = "Combined",
+  timePrefix = FALSE,
+  fileFormat = 'CSV'
+)
+
+task_vector$start()
+ee_monitoring(task_vector) # optional
+ee_drive_to_local(task = task_vector, dsn = dsn, overwrite = TRUE, consider = "last")
+rocCombined = read.csv(dsn)
+
+## Plotting ####
+rocKisSmall$modelScale = "Kisumu local"
+rocKisBig$modelScale = "Kisumu upper"
+rocTigSmall$modelScale = "Tigray local"
+rocTigBig$modelScale = "Tigray upper"
+rocCombined$modelScale = "Combined"
+
+roc = rbind(rocKisSmall, rocKisBig, rocTigSmall, rocTigBig, rocCombined)
+
+roc$class = as.numeric(sub("\\_.*", "", roc$system.index))
+# head(roc)
+roc <- roc[with(roc, order(class)), ]
+# head(roc)
+# roc$fill <- paste0('Class', ' ', roc$class, ' ', '(', round(roc$AUC,2) ,')')
+roc$fill <- paste0('Class', ' ', roc$class)
+roc$fill <- factor(roc$fill, levels = unique(roc$fill))
+roc$modelScale <- factor(roc$modelScale, levels = unique(roc$modelScale))
+
+p = ggplot(roc, aes(FPR, TPR, colour=fill))+
+    geom_line()+
+    # geom_smooth(method = 'loess')+
+    facet_wrap(.~modelScale, ncol = 4)+
+    theme_minimal()+
+    guides(colour=guide_legend(ncol=3, title = 'Class'))+
+    theme(
+        legend.position = c(0.8, 0.225)
+    )
+gb = grid.rect(.5,.5,width=unit(1,"npc"), height=unit(1,"npc"), 
+               gp=gpar(lwd=1, fill=NA, col="lightgray"))
+
+p <- grid.arrange(p, ncol=1)
+p <- gTree(children = gList(p, gb))
+ggsave(plot=p, device = 'png', filename = "figures/ROC_plot.png", 
+       width = 7.29, height = 4.5,
+       dpi = 300)
+ggsave(plot=p, device = 'tiff', filename = "figures/ROC_plot.tif",
+       width = 7.29, height = 4.5,
+       dpi = 300)
+ggsave(plot=p, device = 'pdf', filename = "figures/ROC_plot.pdf", 
+       width = 7.29, height = 4.5,
+       dpi = 300)
+
+```
+
+```{r fig7,echo=FALSE,out.width='100%',fig.cap="Receiver operator curves as class-specific accuracy assessement of a probabilistic land use classification in Horn of Africa"}
+knitr::include_graphics("figures/ROC_plot.png")
 ```
 
 # Introduction {#I}
